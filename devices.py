@@ -1,0 +1,698 @@
+from device import Device
+from stage import PayloadStage, PatchStage
+from patch_utils import MatchMode
+
+
+DEVICES = [
+    Device(
+        'Pacman',
+        'Nothing Phone 2a',
+        {
+            # Ideally, we'd make room in the 'lk' partition for the payload, but for the sake
+            # of this demonstration, we take advantage of the fact that the BSP for this phone     
+            # includes a lot of eMMC-related code that isn’t actually used, since this device 
+            # uses UFS instead.                                                               
+            #                                                                                 
+            # Technically, these stages are not required by the exploit. They simply show    
+            # that we can execute arbitrary code within the LK image, which is way cooler    
+            # than just applying patches.                                                    
+            #                                                                                 
+            # The first address is the virtual base address where the stage payload is       
+            # injected. The second address is the address of the `bl` call that we override  
+            # to jump to the payload instead (called pivot by me, which is probably wrong).
+            #'stage1': PayloadStage(
+            #    'stage1',
+            #    0xFFFF000050F6F0A8,  # emmc_init()
+            #    0xFFFF000050F05DA4,  # platform_init()
+            #    description='Pre-platform initialization stage',
+            #),
+            #'stage2': PayloadStage(
+            #    'stage2',
+            #    0xFFFF000050F6AE98, # msdc_tune_cmdrsp()
+            #    0xFFFF000050F0E088, # bl notify_enter_fastboot()
+            #    description='Pre-fastboot initialization stage',
+            #),
+            #'stage3': PayloadStage(
+            #    'stage3',
+            #    0xFFFF000050F6C168, # msdc_config_bus()
+            #    0xFFFF000050F0E0A4, # bl dprintf("%s:%d: Notify boot linux.\n")
+            #    description='Linux initialization stage',
+            #),
+
+            # This is what makes it possible for this exploit to work. Long
+            # story short, an LK image has various partitions inside it,
+            # which each have a specific purpose and get loaded at a specific
+            # address. The order matters, and each partition verifies the next
+            # one before loading it.
+            #
+            # From my analysis, the boot chain of this device is as follows:
+            # 1. BootROM (SoC)
+            # 2. Preloader
+            # 3. bl2_ext (LK)
+            # 4. TEE
+            # 5. GenieZone (GZ)
+            # 6. lk or aee (LK)
+            # 7. Linux kernel (boot)
+            # 8. ...
+            #
+            # BootROM is the first stage and is not modifiable (it's masked ROM) and
+            # it ALWAYS verifies and loads the Preloader against the fused root key. 
+            # Then, under normal circumstances, the Preloader verifies and loads bl2_ext, 
+            # which is the first partition of 'lk' to get verified and loaded. Then
+            # bl2_ext takes control of the boot process and verifies and loads
+            # the next partitions: TEE, GZ, LK, and so on.
+            #
+            # HOWEVER, this is not the case when seccfg is unlocked. When this
+            # happens, the Preloader DOES NOT verify bl2_ext even though bl2_ext
+            # itself still verifies the subsequent partitions. This means that one
+            # can arbitrarily modify bl2_ext so it does not verify the next
+            # partitions, which would lead to a full takeover of the secure boot chain.
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                # This is because every partition inside the LK image has its own function
+                # that is called to verify the next partition. We take advantage of the fact
+                # that the signature of the function is always the same, so we can apply the
+                # patch to all of them at once.
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+
+            # Since at this point we have full control over the boot chain, we can
+            # easily patch the lk partition, which is the one that takes care of
+            # setting up the boot state of the device, which is then used by Android
+            # to determine whether the device is locked or unlocked.
+            #
+            # The goal here is to spoof the boot state to always be set to green and
+            # thus trick TEE and Android into thinking that the device hasn't been
+            # tampered with so we can pass STRONG, DEVICE and BASIC Play Store Integrity
+            # checks.
+            #
+            # Most likely the first two patches are not needed, but it's better to be safe
+            # than sorry.
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='c8 03 00 90 00 21 01 b9 c0 03 5f d6',
+                replacement='c8 03 00 90 1f 21 01 b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='a9 74 01 94 20 01 00 36',
+                replacement='a9 74 01 94 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52',
+                replacement='48 44 00 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            ),
+        },
+    ),
+    Device(
+        'PacmanPro',
+        'Nothing Phone 2a Plus',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='c8 03 00 b0 00 21 01 b9 c0 03 5f d6',
+                replacement='c8 03 00 b0 1f 21 01 b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='0b 75 01 94 20 01 00 36',
+                replacement='0b 75 01 94 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52',
+                replacement='48 44 00 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            )
+        },
+    ),
+    Device(
+        'Tetris',
+        'CMF Phone 1',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='68 04 00 f0 00 d9 04 b9 c0 03 5f d6',
+                replacement='68 04 00 f0 1f d9 04 b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c4 ff ff 97 e8 03 00 2a e0 03 1f 2a 68 02 00 b9',
+                replacement='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 48 04 80 52 68 02 00 b9 e0 03 1f 2a f3 0b 40 f9 fd 7b c2 a8',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            )
+        },
+    ),
+    Device(
+        'LG8n',
+        'Tecno Pova 4 Pro',
+        {
+            'stage1': PayloadStage(
+                'stage1',
+                0xFFFF000050F23D60,
+                0xFFFF000050F049E0,
+                description='Pre-platform initialization stage',
+            ),
+            'stage2': PayloadStage(
+                'stage2',
+                0xFFFF000050F1FCD0,
+                0xFFFF000050F0CCE4,
+                description='Pre-fastboot initialization stage',
+            ),
+            'stage3': PayloadStage(
+                'stage3',
+                0xFFFF000050F21020, # msdc_config_bus()
+                0xFFFF000050F0CD00, # bl dprintf("%s:%d: Notify boot linux.\n")
+                description='Linux initialization stage',
+            ),
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='e8 02 00 b0 00 f1 0a b9 c0 03 5f d6',
+                replacement='e8 02 00 b0 1f f1 0a b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='e8 0b 40 b9 1f 0d 00 71 21 01 00 54',
+                replacement='e8 0b 40 b9 1f 0d 00 71 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security check - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c9',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5 c9',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            ),
+            'dont_relock_seccfg': PatchStage(
+                'dont_relock_seccfg',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 2a 28 00 80 52',
+                replacement='00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Prevent LK from relocking seccfg',
+            ),
+        },
+    ),
+    Device(
+        'LH7n',
+        'Tecno Pova 5',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='a8 03 00 d0 00 29 0d b9 c0 03 5f d6',
+                replacement='a8 03 00 d0 1f 29 0d b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='e8 0b 40 b9 1f 0d 00 71 21 01 00 54',
+                replacement='e8 0b 40 b9 1f 0d 00 71 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c9',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5 c9',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            ),
+            'dont_relock_seccfg': PatchStage(
+                'dont_relock_seccfg',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 2a 28 00 80 52',
+                replacement='00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Prevent LK from relocking seccfg',
+            )
+        },
+    ),
+    Device(
+        'LG7n',
+        'Tecno Pova 4',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='c8 02 00 f0 00 29 0a b9 c0 03 5f d6',
+                replacement='c8 02 00 f0 1f 29 0a b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='e8 0b 40 b9 1f 0d 00 71 21 01 00 54',
+                replacement='e8 0b 40 b9 1f 0d 00 71 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security check - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c9',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5 c9',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            ),
+            'dont_relock_seccfg': PatchStage(
+                'dont_relock_seccfg',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 2a 28 00 80 52',
+                replacement='00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Prevent LK from relocking seccfg',
+            ),
+        },
+    ),
+    Device(
+        'Q25',
+        'Zinwa Q25',
+        {
+            'stage1': PayloadStage(
+                'stage1',
+                0xffff000050f23670,  # unknown emmc_init() adjacent func
+                0xffff000050f04a18,  # bl platform_init()
+                description='Pre-platform initialization stage',
+            ),
+            'stage2': PayloadStage(
+                'stage2',
+                0xffff000050f1f690, # msdc_tune_cmdrsp()
+                0xffff000050f0c858, # bl notify_enter_fastboot()
+                description='Pre-fastboot initialization stage',
+            ),
+            'stage3': PayloadStage(
+                'stage3',
+                0xffff000050f209e0, # msdc_config_bus()
+                0xffff000050f0c874, # bl dprintf("%s:%d: Notify boot linux.\n")
+                description='Linux initialization stage',
+            ),
+
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='a8 02 00 b0 00 c1 09 b9 c0 03 5f d6',
+                replacement='a8 02 00 b0 1f c1 09 b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='e8 0b 40 b9 1f 0d 00 71 21 01 00 54',
+                replacement='e8 0b 40 b9 1f 0d 00 71 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security check - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c9',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5 c9',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            ),
+            'dont_relock_seccfg': PatchStage(
+                'dont_relock_seccfg',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 2a 28 00 80 52',
+                replacement='00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Prevent LK from relocking seccfg',
+            ),
+        },
+    ),
+    Device(
+        'peridotl',
+        'Lenovo IdeaTab Pro / Xiaoxin Pad Pro 12.7',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='c8 04 00 90 00 f9 03 b9 c0 03 5f d6',
+                replacement='c8 04 00 90 1f f9 03 b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='88 17 40 b9 c8 01 00 34',
+                replacement='88 17 40 b9 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'bypass_lock_control': PatchStage(
+                'bypass_lock_control',
+                pattern='1f 0d 00 71 21 01 00 54',
+                replacement='1f 0d 00 71 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip lock error branch - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            ),
+            'bypass_region_check': PatchStage(
+                'bypass_region_check',
+                pattern='ff 03 01 d1 fd 7b 01 a9 f5 13 00 f9 f4 4f 03 a9 fd 43 00 91 f3 03 00 aa bf c3 1f b8',
+                replacement='00 00 80 52 c0 03 5f d6 f5 13 00 f9 f4 4f 03 a9 fd 43 00 91 f3 03 00 aa bf c3 1f b8',
+                match_mode=MatchMode.ALL,
+                description='Skip region check - allow crossflashing',
+            ),
+            'avb_allow_verification_error': PatchStage(
+                'avb_allow_verification_error',
+                pattern='e1 07 9f 1a fa 17 9f 1a 15 05 88 1a',
+                replacement='e1 07 9f 1a 3a 00 80 52 15 05 88 1a',
+                match_mode=MatchMode.ALL,
+                description='Force AVB_SLOT_VERIFY_FLAGS_ALLOW_VERIFICATION_ERROR',
+            ),
+        },
+    ),
+    Device(
+        'S666LN',
+        'itel RS4',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='88 03 00 f0 00 e1 0c b9 c0 03 5f d6',
+                replacement='88 03 00 f0 1f e1 0c b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='e8 0b 40 b9 1f 0d 00 71 21 01 00 54',
+                replacement='e8 0b 40 b9 1f 0d 00 71 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c9',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5 c9',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'spoof_lock_state': PatchStage(
+                'spoof_lock_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force lock state to always be LKS_LOCK',
+            ),
+            'dont_relock_seccfg': PatchStage(
+                'dont_relock_seccfg',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 2a 28 00 80 52',
+                replacement='00 00 80 52 c0 03 5f d6 1f 20 03 d5 1f 20 03 d5 1f 20 03 d5',
+                match_mode=MatchMode.ALL,
+                description='Prevent LK from relocking seccfg',
+            )
+        },
+        cert_bypass=True
+    ),
+    Device(
+        'Tanzanite',
+        'Redmi Note 14 4G',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c9',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 1f 20 03 d5 c9',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='68 03 00 d0 00 b1 0d b9 c0 03 5f d6',
+                replacement='68 03 00 d0 1f b1 0d b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='ae e6 01 94 e0 23 00 91 f4 90 00 94 e8 0f 40 b9 68 00 00 34 08 17 40 b9 68 00 00 34',
+                replacement='ae e6 01 94 e0 23 00 91 f4 90 00 94 0e 00 00 14 68 00 00 34 08 17 40 b9 68 00 00 34',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'bypass_security_control2': PatchStage(
+                'bypass_security_control2',
+                pattern='68 53 40 b9 1f 05 00 71 e1 ed ff 54 e8 0f 40 b9',
+                replacement='68 53 40 b9 1f 05 00 71 6f ff ff 17 e8 0f 40 b9',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'spoof_seccfg_state': PatchStage(
+                'spoof_seccfg_state',
+                pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+                replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force seccfg state to always be LKS_LOCK',
+            ),
+            'spoof_get_lock_state': PatchStage(
+                'spoof_custom_lock_state',
+                pattern='a0 13 00 d1 b4 53 3f 29 a7 64 01 94 e0 00 00 34',
+                replacement='a0 13 00 d1 b4 53 3f 29 00 00 80 52 e0 00 00 34',
+                match_mode=MatchMode.ALL,
+                description='Ignore custom_lock state in get_lock_state',
+            ),
+            'spoof_get_lock_state2': PatchStage(
+                'spoof_custom_lock_state2',
+                pattern='18 00 00 14 a0 23 00 d1 a3 00 00 94 00 01 00 34 aa 27 7f 29',
+                replacement='18 00 00 14 a0 23 00 d1 00 00 80 52 00 01 00 34 aa 27 7f 29',
+                match_mode=MatchMode.ALL,
+                description='Ignore seccfg state in get_lock_state',
+            ),
+        },
+        cert_bypass=True
+    ),
+    Device(
+        'Tanzanite_New',
+        'Redmi Note 14 4G New LK',
+        {
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='00 01 00 b4 fd 7b bf a9',
+                replacement='00 00 80 52 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy',
+            ),
+            'sec_get_vfy_policy_inlined': PatchStage(
+                'sec_get_vfy_policy_inlined',
+                pattern='88 00 80 52 a0 73 00 91 a8 1f 00 b9 dd 44 ff 97',
+                replacement='68 00 80 52 a0 73 00 91 a8 1f 00 b9 00 00 80 52',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy, inlined usage',
+            ),
+            'sec_get_vfy_policy_inlined2': PatchStage(
+                'sec_get_vfy_policy_inlined2',
+                pattern='88 00 80 52 a0 73 00 91 a8 1f 00 b9 db 45 ff 97',
+                replacement='68 00 80 52 a0 73 00 91 a8 1f 00 b9 00 00 80 52',
+                match_mode=MatchMode.ALL,
+                description='Don\'t enforce secure boot policy, second inlined usage',
+            ),
+            'spoof_sboot_state': PatchStage(
+                'spoof_get_sboot_state',
+                pattern='fd 7b be a9 f3 0b 00 f9 fd 03 00 91 f3 03 00 aa 20 00 80 52 c4 ff ff 97',
+                replacement='48 04 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6 20 00 80 52 c4 ff ff 97',
+                match_mode=MatchMode.ALL,
+                description='Force sboot state to always be ATTR_SBOOT_ONLY_ENABLE_ON_SCHIP',
+            ),
+            'force_green_state': PatchStage(
+                'force_green_state',
+                pattern='c8 03 00 b0 00 81 0a b9 c0 03 5f d6',
+                replacement='c8 03 00 b0 1f 81 0a b9 c0 03 5f d6',
+                match_mode=MatchMode.ALL,
+                description='Force boot state to always be set to green',
+            ),
+            'bypass_security_control': PatchStage(
+                'bypass_security_control',
+                pattern='05 ad 00 94 e8 0f 40 b9 68 00 00 34 68 17 40 b9 68 02 00 34',
+                replacement='05 ad 00 94 e8 0f 40 b9 0d 00 00 14 68 17 40 b9 68 02 00 34',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            'bypass_security_control2': PatchStage(
+                'bypass_security_control2',
+                pattern='c8 2a 41 b9 1f 05 00 71 a1 e9 ff 54 e8 0f 40 b9',
+                replacement='c8 2a 41 b9 1f 05 00 71 4d ff ff 17 e8 0f 40 b9',
+                match_mode=MatchMode.ALL,
+                description='Skip security error branch - always execute commands',
+            ),
+            #'spoof_seccfg_state': PatchStage(
+            #    'spoof_seccfg_state',
+            #    pattern='20 02 00 b4 fd 7b be a9 f3 0b 00 f9 fd 03 00 91',
+            #    replacement='88 00 80 52 08 00 00 b9 00 00 80 52 c0 03 5f d6',
+            #    match_mode=MatchMode.ALL,
+            #    description='Force seccfg state to always be LKS_LOCK',
+            #),
+            'spoof_get_lock_state1': PatchStage(
+                'spoof_get_lock_state1',
+                pattern='b4 53 3f 29 47 91 01 94 e0 00 00 34',
+                replacement='b4 53 3f 29 00 00 80 52 e0 00 00 34',
+                match_mode=MatchMode.ALL,
+                description='Ignore custom_lock_state state in get_lock_state',
+            ),
+            'spoof_get_lock_state2': PatchStage(
+                'spoof_get_lock_state2',
+                pattern='a0 23 00 d1 6e 01 00 94 00 01 00 34',
+                replacement='a0 23 00 d1 00 00 80 52 00 01 00 34',
+                match_mode=MatchMode.ALL,
+                description='Ignore seccfg state in get_lock_state',
+            ),
+        },
+        cert_bypass=True
+    ),
+    Device(
+        'kg6p',
+        'Tecno Spark 8T',
+        {
+            # Verified via Ghidra disassembly + decompiled caller logic (FUN_0004f390,
+            # the [SBC] img vfy caller): a return value of 0 from this function causes
+            # the caller to skip secure certificate/policy enforcement entirely and
+            # branch straight to plain image/hash verification. Confirmed unique
+            # (exactly 1 match) in both the extracted bl2_ext payload and the full lk.img.
+            # Architecture: ARM32 Thumb (not AArch64 like the other devices in this file).
+            'sec_get_vfy_policy': PatchStage(
+                'sec_get_vfy_policy',
+                pattern='08 b5 ff f7 75 ff c0 f3 40 00 08 bd',
+                replacement='00 20 70 47 00 bf 00 bf 00 bf 00 bf',
+                match_mode=MatchMode.ALL,
+                description="Don't enforce secure certificate/policy verification",
+            ),
+        },
+    ),
+]
